@@ -9,11 +9,13 @@ usage() {
 Usage:
 	$SCRIPT_NAME pull github --repo <owner/repo> [--data <snapshot_dir>]
 	$SCRIPT_NAME list [--data <issues_dir>]
+	$SCRIPT_NAME view <issue_number> [--data <issues_dir>]
 	$SCRIPT_NAME edit <prompt> [--data <issues_dir>]
 
 Implements:
 	pull all issues from github repository
 	list all issues stored locally
+	view a single issue in markdown format
 	edit issues via an AI agent using a natural language prompt
 
 Examples:
@@ -21,6 +23,8 @@ Examples:
 	$SCRIPT_NAME pull github --repo octocat/Hello-World --data ./snapshots/hello-world-001
 	$SCRIPT_NAME list
 	$SCRIPT_NAME list --data ./snapshots/hello-world-001
+	$SCRIPT_NAME view 42
+	$SCRIPT_NAME view 42 --data ./snapshots/hello-world-001
 	$SCRIPT_NAME edit "merge similar issues"
 	$SCRIPT_NAME edit "close all issues labelled wontfix" --data ./snapshots/hello-world-001
 EOF
@@ -159,6 +163,43 @@ $issues_context"
 	invoke_agent "$system_prompt" "$user_prompt"
 }
 
+view_issue() {
+	local issues_dir="$1"
+	local issue_number="$2"
+	local issue_file="$issues_dir/by-id/issue-$issue_number.json"
+
+	[[ -f "$issue_file" ]] || error "issue not found: $issue_number"
+
+	local number title state state_reason labels assignees created_at updated_at closed_at html_url body
+	number="$(jq -r '.number' "$issue_file")"
+	title="$(jq -r '.title // "(no title)"' "$issue_file")"
+	state="$(jq -r '.state // ""' "$issue_file")"
+	state_reason="$(jq -r '.state_reason // ""' "$issue_file")"
+	labels="$(jq -r '(.labels // []) | join(", ")' "$issue_file")"
+	assignees="$(jq -r '(.assignees // []) | join(", ")' "$issue_file")"
+	created_at="$(jq -r '.created_at // ""' "$issue_file")"
+	updated_at="$(jq -r '.updated_at // ""' "$issue_file")"
+	closed_at="$(jq -r '.closed_at // "null"' "$issue_file")"
+	html_url="$(jq -r '.html_url // ""' "$issue_file")"
+	body="$(jq -r '.body // ""' "$issue_file")"
+
+	cat <<EOF
+# Issue #$number: $title
+
+**State:** $state${state_reason:+ ($state_reason)}
+**Labels:** ${labels:-_(none)_}
+**Assignees:** ${assignees:-_(none)_}
+**Created:** $created_at
+**Updated:** $updated_at
+**Closed:** $closed_at
+**URL:** $html_url
+
+## Description
+
+$body
+EOF
+}
+
 list_issues() {
 	local issues_dir="$1"
 	local by_id_dir="$issues_dir/by-id"
@@ -247,6 +288,28 @@ main() {
 					error "unsupported source for pull: $source"
 					;;
 			esac
+			;;
+		view)
+			local issue_number="${1:-}"
+			[[ -n "$issue_number" ]] || error "missing issue number for 'view' (e.g.: $SCRIPT_NAME view 42)"
+			shift
+			local out_dir="./issues"
+			while [[ $# -gt 0 ]]; do
+				case "$1" in
+					--data)
+						out_dir="${2:-}"
+						shift 2
+						;;
+					-h|--help)
+						usage
+						exit 0
+						;;
+					*)
+						error "unknown argument: $1"
+						;;
+				esac
+			done
+			view_issue "$out_dir" "$issue_number"
 			;;
 		edit)
 			local user_prompt="${1:-}"
