@@ -9,13 +9,13 @@ usage() {
 Usage:
 	$SCRIPT_NAME pull github --repo <owner/repo> [--data <snapshot_dir>]
 	$SCRIPT_NAME list [--data <issues_dir>]
-	$SCRIPT_NAME view <issue_number> [--data <issues_dir>]
+	$SCRIPT_NAME view [<issue_number>] [--data <issues_dir>]
 	$SCRIPT_NAME edit <prompt> [--data <issues_dir>]
 
 Implements:
 	pull all issues from github repository
 	list all issues stored locally
-	view a single issue in markdown format
+	view a single issue or all issues in markdown format
 	edit issues via an AI agent using a natural language prompt
 
 Examples:
@@ -23,6 +23,7 @@ Examples:
 	$SCRIPT_NAME pull github --repo octocat/Hello-World --data ./snapshots/hello-world-001
 	$SCRIPT_NAME list
 	$SCRIPT_NAME list --data ./snapshots/hello-world-001
+	$SCRIPT_NAME view
 	$SCRIPT_NAME view 42
 	$SCRIPT_NAME view 42 --data ./snapshots/hello-world-001
 	$SCRIPT_NAME edit "merge similar issues"
@@ -163,12 +164,8 @@ $issues_context"
 	invoke_agent "$system_prompt" "$user_prompt"
 }
 
-view_issue() {
-	local issues_dir="$1"
-	local issue_number="$2"
-	local issue_file="$issues_dir/by-id/issue-$issue_number.json"
-
-	[[ -f "$issue_file" ]] || error "issue not found: $issue_number"
+format_issue() {
+	local issue_file="$1"
 
 	local number title state state_reason labels assignees created_at updated_at closed_at html_url body
 	number="$(jq -r '.number' "$issue_file")"
@@ -198,6 +195,31 @@ view_issue() {
 
 $body
 EOF
+}
+
+view_issue() {
+	local issues_dir="$1"
+	local issue_number="$2"
+	local issue_file="$issues_dir/by-id/issue-$issue_number.json"
+
+	[[ -f "$issue_file" ]] || error "issue not found: $issue_number"
+
+	format_issue "$issue_file"
+}
+
+view_all_issues() {
+	local issues_dir="$1"
+	local by_id_dir="$issues_dir/by-id"
+
+	[[ -d "$by_id_dir" ]] || error "issues directory not found: $by_id_dir"
+
+	local first=true
+	for file in $(ls -v "$by_id_dir"/issue-*.json 2>/dev/null); do
+		[[ -f "$file" ]] || continue
+		[[ "$first" == true ]] || echo -e "\n---\n"
+		format_issue "$file"
+		first=false
+	done
 }
 
 list_issues() {
@@ -290,9 +312,11 @@ main() {
 			esac
 			;;
 		view)
-			local issue_number="${1:-}"
-			[[ -n "$issue_number" ]] || error "missing issue number for 'view' (e.g.: $SCRIPT_NAME view 42)"
-			shift
+			local issue_number=""
+			if [[ $# -gt 0 && "$1" != --* && "$1" != -* ]]; then
+				issue_number="$1"
+				shift
+			fi
 			local out_dir="./issues"
 			while [[ $# -gt 0 ]]; do
 				case "$1" in
@@ -309,7 +333,11 @@ main() {
 						;;
 				esac
 			done
-			view_issue "$out_dir" "$issue_number"
+			if [[ -n "$issue_number" ]]; then
+				view_issue "$out_dir" "$issue_number"
+			else
+				view_all_issues "$out_dir"
+			fi
 			;;
 		edit)
 			local user_prompt="${1:-}"
