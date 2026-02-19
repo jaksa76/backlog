@@ -9,16 +9,20 @@ usage() {
 Usage:
 	$SCRIPT_NAME pull github --repo <owner/repo> [--data <snapshot_dir>]
 	$SCRIPT_NAME list [--data <issues_dir>]
+	$SCRIPT_NAME edit <prompt> [--data <issues_dir>]
 
 Implements:
 	pull all issues from github repository
 	list all issues stored locally
+	edit issues via an AI agent using a natural language prompt
 
 Examples:
 	$SCRIPT_NAME pull github --repo octocat/Hello-World
 	$SCRIPT_NAME pull github --repo octocat/Hello-World --data ./snapshots/hello-world-001
 	$SCRIPT_NAME list
 	$SCRIPT_NAME list --data ./snapshots/hello-world-001
+	$SCRIPT_NAME edit "merge similar issues"
+	$SCRIPT_NAME edit "close all issues labelled wontfix" --data ./snapshots/hello-world-001
 EOF
 }
 
@@ -118,6 +122,44 @@ EOF
 	echo "Per-issue files written to $issue_files_dir"
 }
 
+# invoke_agent sends a system prompt and user prompt to a CLI AI agent.
+# Replace the body of this function to use a different agent.
+invoke_agent() {
+	local system_prompt="$1"
+	local user_prompt="$2"
+	require_command gh
+	gh copilot suggest -t shell "$(printf '%s\n\n%s' "$system_prompt" "$user_prompt")"
+}
+
+edit_issues() {
+	local issues_dir="$1"
+	local user_prompt="$2"
+	local by_id_dir="$issues_dir/by-id"
+
+	[[ -d "$by_id_dir" ]] || error "issues directory not found: $by_id_dir"
+
+	# Build issues context from all per-issue JSON files
+	local issues_context
+	issues_context="$(for file in $(ls -v "$by_id_dir"/issue-*.json 2>/dev/null); do
+		[[ -f "$file" ]] || continue
+		cat "$file"
+	done)"
+
+	local system_prompt
+	system_prompt="You are a backlog management assistant. You help manage GitHub issues stored as JSON files on disk.
+
+Each issue lives at: $by_id_dir/issue-<number>.json
+Fields: number, title, state, labels, assignees, created_at, updated_at, closed_at, html_url, body
+All issues are also aggregated in: $issues_dir/issues.ndjson (newline-delimited JSON)
+
+Suggest the shell command(s) needed to fulfil the user request. Operate only on the local files.
+
+Current issues (JSON):
+$issues_context"
+
+	invoke_agent "$system_prompt" "$user_prompt"
+}
+
 list_issues() {
 	local issues_dir="$1"
 	local by_id_dir="$issues_dir/by-id"
@@ -206,6 +248,28 @@ main() {
 					error "unsupported source for pull: $source"
 					;;
 			esac
+			;;
+		edit)
+			local user_prompt="${1:-}"
+			[[ -n "$user_prompt" ]] || error "missing prompt for 'edit' (e.g.: $SCRIPT_NAME edit \"merge similar issues\")"
+			shift
+			local out_dir="./issues"
+			while [[ $# -gt 0 ]]; do
+				case "$1" in
+					--data)
+						out_dir="${2:-}"
+						shift 2
+						;;
+					-h|--help)
+						usage
+						exit 0
+						;;
+					*)
+						error "unknown argument: $1"
+						;;
+				esac
+			done
+			edit_issues "$out_dir" "$user_prompt"
 			;;
 		-h|--help|help)
 			usage
