@@ -30,10 +30,35 @@ require_command() {
 	fi
 }
 
+extract_issue_files() {
+	local issues_file="$1"
+	local out_dir="$2"
+
+	mkdir -p "$out_dir"
+
+	jq -c '{
+		number,
+		title,
+		state,
+		labels: ((.labels // []) | map(.name)),
+		assignees: ((.assignees // []) | map(.login)),
+		created_at,
+		updated_at,
+		closed_at,
+		html_url,
+		body
+	}' "$issues_file" | while IFS= read -r compact_issue; do
+		issue_number="$(jq -r '.number // empty' <<< "$compact_issue")"
+		[[ -n "$issue_number" ]] || continue
+		jq '.' <<< "$compact_issue" > "$out_dir/issue-$issue_number.json"
+	done
+}
+
 pull_github_all_issues() {
 	local repo="$1"
 	local out_dir="$2"
 	local issues_file="$out_dir/issues.ndjson"
+	local issue_files_dir="$out_dir/by-id"
 	local manifest_file="$out_dir/manifest.json"
 	local sources_file="$out_dir/sources.json"
 	local pulled_at
@@ -54,6 +79,8 @@ pull_github_all_issues() {
 
 	issue_count="$(wc -l < "$issues_file" | tr -d ' ')"
 
+	extract_issue_files "$issues_file" "$issue_files_dir"
+
 	cat > "$manifest_file" <<EOF
 {
 	"version": "1",
@@ -62,7 +89,8 @@ pull_github_all_issues() {
 	"pulledAt": "$pulled_at",
 	"issueCount": $issue_count,
 	"files": {
-		"issues": "issues.ndjson"
+		"issues": "issues.ndjson",
+		"byId": "by-id"
 	}
 }
 EOF
@@ -83,6 +111,7 @@ EOF
 
 	echo "Pulled $issue_count issues from $repo"
 	echo "Snapshot written to $out_dir"
+	echo "Per-issue files written to $issue_files_dir"
 }
 
 main() {
@@ -128,8 +157,7 @@ main() {
 
 					[[ -n "$repo" ]] || error "--repo is required (format: owner/repo)"
 					if [[ -z "$out_dir" ]]; then
-						timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
-						out_dir="./snapshots/${repo//\//-}-$timestamp"
+						out_dir="./issues/"
 					fi
 
 					pull_github_all_issues "$repo" "$out_dir"
