@@ -127,8 +127,7 @@ EOF
 invoke_agent() {
 	local system_prompt="$1"
 	local user_prompt="$2"
-	require_command gh
-	gh copilot suggest -t shell "$(printf '%s\n\n%s' "$system_prompt" "$user_prompt")"
+	copilot suggest -t shell "$(printf '%s\n\n%s' "$system_prompt" "$user_prompt")"
 }
 
 edit_issues() {
