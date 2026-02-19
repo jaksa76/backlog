@@ -8,13 +8,17 @@ usage() {
 	cat <<EOF
 Usage:
 	$SCRIPT_NAME pull github --repo <owner/repo> [--data <snapshot_dir>]
+	$SCRIPT_NAME list [--data <issues_dir>]
 
 Implements:
 	pull all issues from github repository
+	list all issues stored locally
 
 Examples:
 	$SCRIPT_NAME pull github --repo octocat/Hello-World
 	$SCRIPT_NAME pull github --repo octocat/Hello-World --data ./snapshots/hello-world-001
+	$SCRIPT_NAME list
+	$SCRIPT_NAME list --data ./snapshots/hello-world-001
 EOF
 }
 
@@ -114,6 +118,23 @@ EOF
 	echo "Per-issue files written to $issue_files_dir"
 }
 
+list_issues() {
+	local issues_dir="$1"
+	local by_id_dir="$issues_dir/by-id"
+
+	[[ -d "$by_id_dir" ]] || error "issues directory not found: $by_id_dir"
+
+	for file in $(ls -v "$by_id_dir"/issue-*.json 2>/dev/null); do
+		[[ -f "$file" ]] || continue
+		local basename
+		basename="$(basename "$file" .json)"
+		local id="${basename#issue-}"
+		local title
+		title="$(jq -r '.title // "(no title)"' "$file")"
+		printf '%s\t%s\n' "$id" "$title"
+	done
+}
+
 main() {
 	if [[ $# -lt 1 ]]; then
 		usage
@@ -124,6 +145,25 @@ main() {
 	shift
 
 	case "$command" in
+		list)
+			local out_dir="./issues"
+			while [[ $# -gt 0 ]]; do
+				case "$1" in
+					--data)
+						out_dir="${2:-}"
+						shift 2
+						;;
+					-h|--help)
+						usage
+						exit 0
+						;;
+					*)
+						error "unknown argument: $1"
+						;;
+				esac
+			done
+			list_issues "$out_dir"
+			;;
 		pull)
 			local source="${1:-}"
 			[[ -n "$source" ]] || error "missing source after 'pull'"
@@ -170,6 +210,7 @@ main() {
 		-h|--help|help)
 			usage
 			;;
+
 		*)
 			error "unsupported command: $command"
 			;;

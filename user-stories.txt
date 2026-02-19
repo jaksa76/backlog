@@ -1,10 +1,8 @@
-pull all issues from github repository
 pull all issues from jira
 select issues to pull based on last modified date (github)
 select issues to pull based on last modified date (jira)
 select issues to pull based on label (github)
-pull all issues from github project
-list issues
+pull all issues from github project (rather than repo)
 manipulate issues overview using agent
 use copilot agent
 use claude agent
