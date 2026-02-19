@@ -4,19 +4,35 @@ set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 
+# Fields compared when computing diffs and conflicts.
+# html_url, created_at, updated_at, closed_at, number are not user-editable.
+COMPARABLE_FIELDS=("title" "state" "labels" "assignees" "body")
+
 usage() {
 	cat <<EOF
 Usage:
-	$SCRIPT_NAME pull github --repo <owner/repo> [--data <snapshot_dir>]
+	$SCRIPT_NAME pull github --repo <owner/repo> [--data <issues_dir>]
 	$SCRIPT_NAME list [--data <issues_dir>]
 	$SCRIPT_NAME view [<issue_number>] [--data <issues_dir>]
 	$SCRIPT_NAME edit <prompt> [--data <issues_dir>]
+	$SCRIPT_NAME changes --local|--remote [--data <issues_dir>]
+	$SCRIPT_NAME conflicts [--data <issues_dir>]
+	$SCRIPT_NAME merge [--data <issues_dir>]
+	$SCRIPT_NAME push [--dry-run] [--force] [--data <issues_dir>]
 
 Implements:
-	pull all issues from github repository
-	list all issues stored locally
-	view a single issue or all issues in markdown format
-	edit issues via an AI agent using a natural language prompt
+	pull       pull all issues from a github repository
+	list       list all issues stored locally
+	view       view a single issue or all issues in markdown format
+	edit       edit issues via an AI agent using a natural language prompt
+	changes    list issues changed locally (--local) or remotely since last pull (--remote)
+	conflicts  show fields changed both locally and remotely with different values
+	merge      apply non-conflicting remote changes to local issue files
+	push       push local changes to GitHub (skips conflicts unless --force)
+
+Local conventions:
+	Delete an issue locally by removing its <number>.json file.
+	Create a new issue by adding a new-issue-<name>.json file with title/body/labels/assignees.
 
 Examples:
 	$SCRIPT_NAME pull github --repo octocat/Hello-World
@@ -28,6 +44,12 @@ Examples:
 	$SCRIPT_NAME view 42 --data ./my-backlog
 	$SCRIPT_NAME edit "merge similar issues"
 	$SCRIPT_NAME edit "close all issues labelled wontfix" --data ./my-backlog
+	$SCRIPT_NAME changes --local
+	$SCRIPT_NAME changes --remote --data ./my-backlog
+	$SCRIPT_NAME conflicts
+	$SCRIPT_NAME merge
+	$SCRIPT_NAME push --dry-run
+	$SCRIPT_NAME push --force
 EOF
 }
 
@@ -133,7 +155,7 @@ EOF
 invoke_agent() {
 	local system_prompt="$1"
 	local user_prompt="$2"
-	copilot suggest -t shell "$(printf '%s\n\n%s' "$system_prompt" "$user_prompt")"
+	copilot  --allow-all-tools --add-dir . -p "$(printf '%s\n\n%s' "$system_prompt" "$user_prompt")"
 }
 
 edit_issues() {
@@ -235,7 +257,522 @@ list_issues() {
 		title="$(jq -r '.title // "(no title)"' "$file")"
 		printf '%s\t%s\n' "$id" "$title"
 	done
+
+	for file in "$issues_dir"/new-issue-*.json; do
+		[[ -f "$file" ]] || continue
+		local basename
+		basename="$(basename "$file" .json)"
+		local title
+		title="$(jq -r '.title // "(no title)"' "$file")"
+		printf '%s\t%s\n' "$basename" "$title"
+	done
 }
+
+# ---------------------------------------------------------------------------
+# Snapshot / remote helpers
+# ---------------------------------------------------------------------------
+
+get_repo_from_manifest() {
+	local issues_dir="$1"
+	local manifest="$issues_dir/.snapshot/manifest.json"
+	[[ -f "$manifest" ]] || error "no snapshot manifest found in $issues_dir/.snapshot/ - run 'pull' first"
+	jq -r '.repo' "$manifest"
+}
+
+require_snapshot() {
+	local issues_dir="$1"
+	[[ -f "$issues_dir/.snapshot/issues.ndjson" ]] || error "no snapshot found in $issues_dir/.snapshot/ - run 'pull' first"
+}
+
+# Fetch current issues from GitHub as normalised ndjson (stdout), without modifying snapshot
+fetch_remote_ndjson() {
+	local repo="$1"
+	require_command gh
+	gh api \
+		--paginate \
+		-H "Accept: application/vnd.github+json" \
+		"/repos/$repo/issues?state=all&per_page=100&sort=updated&direction=desc" \
+		--jq '.[] | select(has("pull_request") | not) | {
+			number,
+			title,
+			state,
+			labels: ((.labels // []) | map(.name)),
+			assignees: ((.assignees // []) | map(.login)),
+			created_at,
+			updated_at,
+			closed_at,
+			html_url,
+			body
+		}'
+}
+
+# Output names of COMPARABLE_FIELDS that differ between two JSON strings
+fields_that_differ() {
+	local a="$1"
+	local b="$2"
+	for field in "${COMPARABLE_FIELDS[@]}"; do
+		local av bv
+		av="$(jq -c --arg f "$field" '.[$f]' <<< "$a")"
+		bv="$(jq -c --arg f "$field" '.[$f]' <<< "$b")"
+		[[ "$av" == "$bv" ]] || echo "$field"
+	done
+}
+
+# ---------------------------------------------------------------------------
+# changes --local / --remote
+# ---------------------------------------------------------------------------
+
+# Outputs: <type>\t<id>\t<title>  (type = new|modified|deleted)
+compute_local_changes() {
+	local issues_dir="$1"
+	local snapshot_file="$issues_dir/.snapshot/issues.ndjson"
+	require_snapshot "$issues_dir"
+
+	declare -A snap_data
+	while IFS= read -r line; do
+		local num
+		num="$(jq -r '.number' <<< "$line")"
+		[[ -n "$num" ]] || continue
+		snap_data["$num"]="$line"
+	done < "$snapshot_file"
+
+	# New issues: new-issue-* files
+	for f in "$issues_dir"/new-issue-*.json; do
+		[[ -f "$f" ]] || continue
+		local name title
+		name="$(basename "$f" .json)"
+		title="$(jq -r '.title // "(no title)"' "$f")"
+		printf 'new\t%s\t%s\n' "$name" "$title"
+	done
+
+	# Deleted: in snapshot but file no longer present
+	for num in "${!snap_data[@]}"; do
+		[[ -f "$issues_dir/$num.json" ]] && continue
+		local title
+		title="$(jq -r '.title // "(no title)"' <<< "${snap_data[$num]}")"
+		printf 'deleted\t%s\t%s\n' "$num" "$title"
+	done
+
+	# Modified: exists in both but content differs on comparable fields
+	for num in "${!snap_data[@]}"; do
+		local f="$issues_dir/$num.json"
+		[[ -f "$f" ]] || continue
+		local changed_fields
+		changed_fields="$(fields_that_differ "${snap_data[$num]}" "$(cat "$f")")"
+		[[ -n "$changed_fields" ]] || continue
+		local title
+		title="$(jq -r '.title // "(no title)"' "$f")"
+		printf 'modified\t%s\t%s\n' "$num" "$title"
+	done
+}
+
+# Outputs: <type>\t<number>\t<title>  (type = new|modified|deleted)
+# Compares GitHub current state vs snapshot. Does NOT modify snapshot.
+compute_remote_changes() {
+	local issues_dir="$1"
+	local snapshot_file="$issues_dir/.snapshot/issues.ndjson"
+	require_snapshot "$issues_dir"
+
+	local repo
+	repo="$(get_repo_from_manifest "$issues_dir")"
+
+	declare -A snap_data
+	while IFS= read -r line; do
+		local num
+		num="$(jq -r '.number' <<< "$line")"
+		[[ -n "$num" ]] || continue
+		snap_data["$num"]="$line"
+	done < "$snapshot_file"
+
+	declare -A remote_data
+	while IFS= read -r line; do
+		local num
+		num="$(jq -r '.number' <<< "$line")"
+		[[ -n "$num" ]] || continue
+		remote_data["$num"]="$line"
+	done < <(fetch_remote_ndjson "$repo")
+
+	# New remotely (not in snapshot)
+	for num in "${!remote_data[@]}"; do
+		[[ -v snap_data["$num"] ]] && continue
+		local title
+		title="$(jq -r '.title // "(no title)"' <<< "${remote_data[$num]}")"
+		printf 'new\t%s\t%s\n' "$num" "$title"
+	done
+
+	# Deleted remotely
+	for num in "${!snap_data[@]}"; do
+		[[ -v remote_data["$num"] ]] && continue
+		local title
+		title="$(jq -r '.title // "(no title)"' <<< "${snap_data[$num]}")"
+		printf 'deleted\t%s\t%s\n' "$num" "$title"
+	done
+
+	# Modified remotely
+	for num in "${!snap_data[@]}"; do
+		[[ -v remote_data["$num"] ]] || continue
+		local changed_fields
+		changed_fields="$(fields_that_differ "${snap_data[$num]}" "${remote_data[$num]}")"
+		[[ -n "$changed_fields" ]] || continue
+		local title
+		title="$(jq -r '.title // "(no title)"' <<< "${remote_data[$num]}")"
+		printf 'modified\t%s\t%s\n' "$num" "$title"
+	done
+}
+
+cmd_changes() {
+	local issues_dir="$1"
+	local direction="$2"
+
+	[[ -d "$issues_dir" ]] || error "issues directory not found: $issues_dir"
+
+	case "$direction" in
+		--local)
+			compute_local_changes "$issues_dir" \
+				| sort -t$'\t' -k1,1 -k2,2 \
+				| awk -F'\t' '{ printf "%-10s  %-30s  %s\n", $1, $2, $3 }'
+			;;
+		--remote)
+			echo "Fetching remote state (this may take a moment)..." >&2
+			compute_remote_changes "$issues_dir" \
+				| sort -t$'\t' -k1,1 -k2,2 \
+				| awk -F'\t' '{ printf "%-10s  %-30s  %s\n", $1, $2, $3 }'
+			;;
+		*)
+			error "expected --local or --remote"
+			;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
+# conflicts
+# ---------------------------------------------------------------------------
+
+show_conflicts() {
+	local issues_dir="$1"
+	local snapshot_file="$issues_dir/.snapshot/issues.ndjson"
+	require_snapshot "$issues_dir"
+
+	local repo
+	repo="$(get_repo_from_manifest "$issues_dir")"
+
+	declare -A snap_data
+	while IFS= read -r line; do
+		local num
+		num="$(jq -r '.number' <<< "$line")"
+		[[ -n "$num" ]] || continue
+		snap_data["$num"]="$line"
+	done < "$snapshot_file"
+
+	echo "Fetching remote state..." >&2
+	declare -A remote_data
+	while IFS= read -r line; do
+		local num
+		num="$(jq -r '.number' <<< "$line")"
+		[[ -n "$num" ]] || continue
+		remote_data["$num"]="$line"
+	done < <(fetch_remote_ndjson "$repo")
+
+	local any_conflict=false
+	for num in "${!snap_data[@]}"; do
+		local local_file="$issues_dir/$num.json"
+		[[ -f "$local_file" ]] || continue        # locally deleted - not a field conflict
+		[[ -v remote_data["$num"] ]] || continue   # remotely deleted - not a field conflict
+
+		local snap="${snap_data[$num]}"
+		local remote="${remote_data[$num]}"
+		local local_json
+		local_json="$(cat "$local_file")"
+
+		local header_printed=false
+		for field in "${COMPARABLE_FIELDS[@]}"; do
+			local snap_val local_val remote_val
+			snap_val="$(jq -c --arg f "$field" '.[$f]' <<< "$snap")"
+			local_val="$(jq -c --arg f "$field" '.[$f]' <<< "$local_json")"
+			remote_val="$(jq -c --arg f "$field" '.[$f]' <<< "$remote")"
+
+			# Both changed vs snapshot AND diverged from each other
+			[[ "$local_val" != "$snap_val" ]] || continue
+			[[ "$remote_val" != "$snap_val" ]] || continue
+			[[ "$local_val" != "$remote_val" ]] || continue
+
+			if [[ "$header_printed" == false ]]; then
+				any_conflict=true
+				header_printed=true
+				echo "conflict  #$num  $(jq -r '.title' "$local_file")"
+			fi
+			echo "  field:    $field"
+			echo "  snapshot: $snap_val"
+			echo "  local:    $local_val"
+			echo "  remote:   $remote_val"
+		done
+		[[ "$header_printed" == false ]] || echo ""
+	done
+
+	if [[ "$any_conflict" == false ]]; then
+		echo "No conflicts."
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# merge
+# ---------------------------------------------------------------------------
+
+merge_issues() {
+	local issues_dir="$1"
+	local snapshot_file="$issues_dir/.snapshot/issues.ndjson"
+	require_snapshot "$issues_dir"
+
+	local repo
+	repo="$(get_repo_from_manifest "$issues_dir")"
+
+	declare -A snap_data
+	while IFS= read -r line; do
+		local num
+		num="$(jq -r '.number' <<< "$line")"
+		[[ -n "$num" ]] || continue
+		snap_data["$num"]="$line"
+	done < "$snapshot_file"
+
+	echo "Fetching remote state..." >&2
+	declare -A remote_data
+	while IFS= read -r line; do
+		local num
+		num="$(jq -r '.number' <<< "$line")"
+		[[ -n "$num" ]] || continue
+		remote_data["$num"]="$line"
+	done < <(fetch_remote_ndjson "$repo")
+
+	local added=0 merged=0 skipped_fields=0
+	for num in "${!remote_data[@]}"; do
+		local remote="${remote_data[$num]}"
+		local local_file="$issues_dir/$num.json"
+
+		# New remote issue: write locally if not already present
+		if [[ ! -v snap_data["$num"] ]]; then
+			if [[ ! -f "$local_file" ]]; then
+				jq '.' <<< "$remote" > "$local_file"
+				printf 'added     %s\t%s\n' "$num" "$(jq -r '.title' "$local_file")"
+				((added++)) || true
+			fi
+			continue
+		fi
+
+		# Locally deleted - don't restore
+		[[ -f "$local_file" ]] || continue
+
+		local snap="${snap_data[$num]}"
+		local local_json
+		local_json="$(cat "$local_file")"
+		local new_json="$local_json"
+		local changed=false
+
+		for field in "${COMPARABLE_FIELDS[@]}"; do
+			local snap_val local_val remote_val
+			snap_val="$(jq -c --arg f "$field" '.[$f]' <<< "$snap")"
+			local_val="$(jq -c --arg f "$field" '.[$f]' <<< "$local_json")"
+			remote_val="$(jq -c --arg f "$field" '.[$f]' <<< "$remote")"
+
+			# Remote didn't change this field vs snapshot
+			[[ "$remote_val" != "$snap_val" ]] || continue
+
+			if [[ "$local_val" != "$snap_val" && "$local_val" != "$remote_val" ]]; then
+				# Conflict: skip this field, leave local value intact
+				printf 'skipped   field "%s" on #%s (conflict)\n' "$field" "$num"
+				((skipped_fields++)) || true
+				continue
+			fi
+
+			# Apply remote value to local
+			new_json="$(jq --arg f "$field" --argjson v "$(jq -c --arg f "$field" '.[$f]' <<< "$remote")" '.[$f] = $v' <<< "$new_json")"
+			changed=true
+		done
+
+		if [[ "$changed" == true ]]; then
+			printf '%s\n' "$new_json" > "$local_file"
+			printf 'merged    %s\t%s\n' "$num" "$(jq -r '.title' "$local_file")"
+			((merged++)) || true
+		fi
+	done
+
+	echo ""
+	echo "Done: $added added, $merged merged, $skipped_fields field(s) skipped due to conflicts."
+}
+
+# ---------------------------------------------------------------------------
+# push
+# ---------------------------------------------------------------------------
+
+push_changes() {
+	local issues_dir="$1"
+	local dry_run="$2"
+	local force="$3"
+	local snapshot_file="$issues_dir/.snapshot/issues.ndjson"
+	require_snapshot "$issues_dir"
+
+	local repo
+	repo="$(get_repo_from_manifest "$issues_dir")"
+
+	declare -A snap_data
+	while IFS= read -r line; do
+		local num
+		num="$(jq -r '.number' <<< "$line")"
+		[[ -n "$num" ]] || continue
+		snap_data["$num"]="$line"
+	done < "$snapshot_file"
+
+	# Fetch remote state for conflict detection (skip only when --force, still fetch for --dry-run info)
+	declare -A remote_data
+	if [[ "$force" == false ]]; then
+		echo "Fetching remote state for conflict detection..." >&2
+		while IFS= read -r line; do
+			local num
+			num="$(jq -r '.number' <<< "$line")"
+			[[ -n "$num" ]] || continue
+			remote_data["$num"]="$line"
+		done < <(fetch_remote_ndjson "$repo")
+	fi
+
+	local created=0 updated=0 closed=0 skipped=0
+
+	# --- New issues (new-issue-* files) ---
+	for f in "$issues_dir"/new-issue-*.json; do
+		[[ -f "$f" ]] || continue
+		local name title body labels assignees payload
+		name="$(basename "$f" .json)"
+		title="$(jq -r '.title // ""' "$f")"
+		body="$(jq -r '.body // ""' "$f")"
+		labels="$(jq -c '.labels // []' "$f")"
+		assignees="$(jq -c '.assignees // []' "$f")"
+		payload="$(jq -n \
+			--arg title "$title" \
+			--arg body "$body" \
+			--argjson labels "$labels" \
+			--argjson assignees "$assignees" \
+			'{title: $title, body: $body, labels: $labels, assignees: $assignees}')"
+
+		if [[ "$dry_run" == true ]]; then
+			printf 'would create  [%s]: %s\n' "$name" "$title"
+			((created++)) || true
+			continue
+		fi
+
+		local real_num
+		real_num="$(gh api \
+			--method POST \
+			-H "Accept: application/vnd.github+json" \
+			"/repos/$repo/issues" \
+			--input - <<< "$payload" \
+			| jq -r '.number')"
+		printf 'created  #%s  %s  (was %s)\n' "$real_num" "$title" "$name"
+		# Rename file and update number field
+		jq --argjson n "$real_num" '.number = $n' "$f" > "$issues_dir/$real_num.json"
+		rm "$f"
+		((created++)) || true
+	done
+
+	# --- Deleted issues (in snapshot but file gone) ---
+	for num in "${!snap_data[@]}"; do
+		[[ -f "$issues_dir/$num.json" ]] && continue
+		local snap_title
+		snap_title="$(jq -r '.title // "(no title)"' <<< "${snap_data[$num]}")"
+
+		# Skip if remote also changed since pull (unless --force)
+		if [[ "$force" == false && -v remote_data["$num"] ]]; then
+			local changed_fields
+			changed_fields="$(fields_that_differ "${snap_data[$num]}" "${remote_data[$num]}")"
+			if [[ -n "$changed_fields" ]]; then
+				printf 'skipped  #%s  %s  (remote changed since pull; use --force to override)\n' "$num" "$snap_title"
+				((skipped++)) || true
+				continue
+			fi
+		fi
+
+		if [[ "$dry_run" == true ]]; then
+			printf 'would close  #%s: %s\n' "$num" "$snap_title"
+			((closed++)) || true
+			continue
+		fi
+
+		gh api \
+			--method PATCH \
+			-H "Accept: application/vnd.github+json" \
+			"/repos/$repo/issues/$num" \
+			-f state=closed > /dev/null
+		printf 'closed   #%s  %s\n' "$num" "$snap_title"
+		((closed++)) || true
+	done
+
+	# --- Modified issues ---
+	for num in "${!snap_data[@]}"; do
+		local local_file="$issues_dir/$num.json"
+		[[ -f "$local_file" ]] || continue
+
+		local snap="${snap_data[$num]}"
+		local changed_fields
+		changed_fields="$(fields_that_differ "$snap" "$(cat "$local_file")")"
+		[[ -n "$changed_fields" ]] || continue  # not modified locally
+
+		local title
+		title="$(jq -r '.title // "(no title)"' "$local_file")"
+
+		# Conflict detection: any field changed both locally and remotely to different values?
+		if [[ "$force" == false && -v remote_data["$num"] ]]; then
+			local remote="${remote_data[$num]}"
+			local has_conflict=false
+			for field in "${COMPARABLE_FIELDS[@]}"; do
+				local snap_val local_val remote_val
+				snap_val="$(jq -c --arg f "$field" '.[$f]' <<< "$snap")"
+				local_val="$(jq -c --arg f "$field" '.[$f]' <<< "$(cat "$local_file")")"
+				remote_val="$(jq -c --arg f "$field" '.[$f]' <<< "$remote")"
+				if [[ "$local_val" != "$snap_val" && "$remote_val" != "$snap_val" && "$local_val" != "$remote_val" ]]; then
+					has_conflict=true
+					break
+				fi
+			done
+			if [[ "$has_conflict" == true ]]; then
+				printf 'skipped  #%s  %s  (has conflicts; run conflicts to review or use --force)\n' "$num" "$title"
+				((skipped++)) || true
+				continue
+			fi
+		fi
+
+		# Build PATCH payload from fields that differ locally vs snapshot
+		local payload="{}"
+		local local_json
+		local_json="$(cat "$local_file")"
+		for field in "${COMPARABLE_FIELDS[@]}"; do
+			local snap_val local_val
+			snap_val="$(jq -c --arg f "$field" '.[$f]' <<< "$snap")"
+			local_val="$(jq -c --arg f "$field" '.[$f]' <<< "$local_json")"
+			[[ "$local_val" != "$snap_val" ]] || continue
+			payload="$(jq --arg f "$field" --argjson v "$(jq -c --arg f "$field" '.[$f]' <<< "$local_json")" '.[$f] = $v' <<< "$payload")"
+		done
+
+		if [[ "$dry_run" == true ]]; then
+			printf 'would update  #%s: %s\n' "$num" "$title"
+			jq -r 'to_entries[] | "  \(.key): \(.value | tojson)"' <<< "$payload"
+			((updated++)) || true
+			continue
+		fi
+
+		gh api \
+			--method PATCH \
+			-H "Accept: application/vnd.github+json" \
+			"/repos/$repo/issues/$num" \
+			--input - <<< "$payload" > /dev/null
+		printf 'updated  #%s  %s\n' "$num" "$title"
+		((updated++)) || true
+	done
+
+	echo ""
+	if [[ "$dry_run" == true ]]; then
+		printf 'Dry run: %d to create, %d to update, %d to close, %d skipped.\n' "$created" "$updated" "$closed" "$skipped"
+	else
+		printf 'Done: %d created, %d updated, %d closed, %d skipped.\n' "$created" "$updated" "$closed" "$skipped"
+	fi
+}
+
 
 main() {
 	if [[ $# -lt 1 ]]; then
@@ -358,6 +895,98 @@ main() {
 				esac
 			done
 			edit_issues "$out_dir" "$user_prompt"
+			;;
+		changes)
+			local direction=""
+			local out_dir="./backlog"
+			while [[ $# -gt 0 ]]; do
+				case "$1" in
+					--local|--remote)
+						direction="$1"
+						shift
+						;;
+					--data)
+						out_dir="${2:-}"
+						shift 2
+						;;
+					-h|--help)
+						usage
+						exit 0
+						;;
+					*)
+						error "unknown argument: $1"
+						;;
+				esac
+			done
+			[[ -n "$direction" ]] || error "expected --local or --remote"
+			cmd_changes "$out_dir" "$direction"
+			;;
+		conflicts)
+			local out_dir="./backlog"
+			while [[ $# -gt 0 ]]; do
+				case "$1" in
+					--data)
+						out_dir="${2:-}"
+						shift 2
+						;;
+					-h|--help)
+						usage
+						exit 0
+						;;
+					*)
+						error "unknown argument: $1"
+						;;
+				esac
+			done
+			show_conflicts "$out_dir"
+			;;
+		merge)
+			local out_dir="./backlog"
+			while [[ $# -gt 0 ]]; do
+				case "$1" in
+					--data)
+						out_dir="${2:-}"
+						shift 2
+						;;
+					-h|--help)
+						usage
+						exit 0
+						;;
+					*)
+						error "unknown argument: $1"
+						;;
+				esac
+			done
+			merge_issues "$out_dir"
+			;;
+		push)
+			local out_dir="./backlog"
+			local dry_run=false
+			local force=false
+			while [[ $# -gt 0 ]]; do
+				case "$1" in
+					--dry-run)
+						dry_run=true
+						shift
+						;;
+					--force)
+						force=true
+						shift
+						;;
+					--data)
+						out_dir="${2:-}"
+						shift 2
+						;;
+					-h|--help)
+						usage
+						exit 0
+						;;
+					*)
+						error "unknown argument: $1"
+						;;
+				esac
+			done
+			push_changes "$out_dir" "$dry_run" "$force"
 			;;
 		-h|--help|help)
 			usage

@@ -3,8 +3,6 @@ select issues to pull based on last modified date (github)
 select issues to pull based on last modified date (jira)
 select issues to pull based on label (github)
 pull all issues from github project (rather than repo)
-manipulate issues overview using agent
-use copilot agent
 use claude agent
 use codex agent
 prepare changes to push to issue tracker (github)
@@ -13,13 +11,7 @@ push changes to github
 push changes to jira
 pull issues from github repository using search query
 pull issues from jira using jql query
-pack snapshot issues into a single editable plaintext file
-generate structured patch file (changes.json) from natural language instructions
-validate generated patch file against schema before planning or applying
-review deterministic per-issue diff before apply
+backlog view --json
 run apply in dry-run mode
-enforce preconditions using remote updated timestamp
 apply only allowed operations from patch file
-make apply idempotent when rerun
-write apply audit logs (applied, errors, summary)
 show warnings for risky edits, missing labels, or conflicts
