@@ -20,14 +20,14 @@ Implements:
 
 Examples:
 	$SCRIPT_NAME pull github --repo octocat/Hello-World
-	$SCRIPT_NAME pull github --repo octocat/Hello-World --data ./snapshots/hello-world-001
+	$SCRIPT_NAME pull github --repo octocat/Hello-World --data ./my-backlog
 	$SCRIPT_NAME list
-	$SCRIPT_NAME list --data ./snapshots/hello-world-001
+	$SCRIPT_NAME list --data ./my-backlog
 	$SCRIPT_NAME view
 	$SCRIPT_NAME view 42
-	$SCRIPT_NAME view 42 --data ./snapshots/hello-world-001
+	$SCRIPT_NAME view 42 --data ./my-backlog
 	$SCRIPT_NAME edit "merge similar issues"
-	$SCRIPT_NAME edit "close all issues labelled wontfix" --data ./snapshots/hello-world-001
+	$SCRIPT_NAME edit "close all issues labelled wontfix" --data ./my-backlog
 EOF
 }
 
@@ -63,23 +63,24 @@ extract_issue_files() {
 	}' "$issues_file" | while IFS= read -r compact_issue; do
 		issue_number="$(jq -r '.number // empty' <<< "$compact_issue")"
 		[[ -n "$issue_number" ]] || continue
-		jq '.' <<< "$compact_issue" > "$out_dir/issue-$issue_number.json"
+		jq '.' <<< "$compact_issue" > "$out_dir/$issue_number.json"
 	done
 }
 
 pull_github_all_issues() {
 	local repo="$1"
 	local out_dir="$2"
-	local issues_file="$out_dir/issues.ndjson"
-	local issue_files_dir="$out_dir/by-id"
-	local manifest_file="$out_dir/manifest.json"
-	local sources_file="$out_dir/sources.json"
+	local snapshot_dir="$out_dir/.snapshot"
+	local issues_file="$snapshot_dir/issues.ndjson"
+	local manifest_file="$snapshot_dir/manifest.json"
+	local sources_file="$snapshot_dir/sources.json"
 	local pulled_at
 	local issue_count
 
 	require_command gh
 
 	mkdir -p "$out_dir"
+	mkdir -p "$snapshot_dir"
 
 	pulled_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
@@ -92,7 +93,7 @@ pull_github_all_issues() {
 
 	issue_count="$(wc -l < "$issues_file" | tr -d ' ')"
 
-	extract_issue_files "$issues_file" "$issue_files_dir"
+	extract_issue_files "$issues_file" "$out_dir"
 
 	cat > "$manifest_file" <<EOF
 {
@@ -102,8 +103,8 @@ pull_github_all_issues() {
 	"pulledAt": "$pulled_at",
 	"issueCount": $issue_count,
 	"files": {
-		"issues": "issues.ndjson",
-		"byId": "by-id"
+		"issues": ".snapshot/issues.ndjson",
+		"byId": ".."
 	}
 }
 EOF
@@ -123,8 +124,8 @@ EOF
 EOF
 
 	echo "Pulled $issue_count issues from $repo"
-	echo "Snapshot written to $out_dir"
-	echo "Per-issue files written to $issue_files_dir"
+	echo "Snapshot written to $snapshot_dir"
+	echo "Per-issue files written to $out_dir"
 }
 
 # invoke_agent sends a system prompt and user prompt to a CLI AI agent.
@@ -138,13 +139,12 @@ invoke_agent() {
 edit_issues() {
 	local issues_dir="$1"
 	local user_prompt="$2"
-	local by_id_dir="$issues_dir/by-id"
 
-	[[ -d "$by_id_dir" ]] || error "issues directory not found: $by_id_dir"
+	[[ -d "$issues_dir" ]] || error "issues directory not found: $issues_dir"
 
 	# Build issues context from all per-issue JSON files
 	local issues_context
-	issues_context="$(for file in $(ls -v "$by_id_dir"/issue-*.json 2>/dev/null); do
+	issues_context="$(for file in $(ls -v "$issues_dir"/*.json 2>/dev/null); do
 		[[ -f "$file" ]] || continue
 		cat "$file"
 	done)"
@@ -152,9 +152,9 @@ edit_issues() {
 	local system_prompt
 	system_prompt="You are a backlog management assistant. You help manage GitHub issues stored as JSON files on disk.
 
-Each issue lives at: $by_id_dir/issue-<number>.json
+Each issue lives at: $issues_dir/<number>.json
 Fields: number, title, state, labels, assignees, created_at, updated_at, closed_at, html_url, body
-All issues are also aggregated in: $issues_dir/issues.ndjson (newline-delimited JSON)
+Snapshot metadata (ndjson, manifest, sources) lives in: $issues_dir/.snapshot/
 
 Suggest the shell command(s) needed to fulfil the user request. Operate only on the local files.
 
@@ -200,7 +200,7 @@ EOF
 view_issue() {
 	local issues_dir="$1"
 	local issue_number="$2"
-	local issue_file="$issues_dir/by-id/issue-$issue_number.json"
+	local issue_file="$issues_dir/$issue_number.json"
 
 	[[ -f "$issue_file" ]] || error "issue not found: $issue_number"
 
@@ -209,12 +209,11 @@ view_issue() {
 
 view_all_issues() {
 	local issues_dir="$1"
-	local by_id_dir="$issues_dir/by-id"
 
-	[[ -d "$by_id_dir" ]] || error "issues directory not found: $by_id_dir"
+	[[ -d "$issues_dir" ]] || error "issues directory not found: $issues_dir"
 
 	local first=true
-	for file in $(ls -v "$by_id_dir"/issue-*.json 2>/dev/null); do
+	for file in $(ls -v "$issues_dir"/*.json 2>/dev/null); do
 		[[ -f "$file" ]] || continue
 		[[ "$first" == true ]] || echo -e "\n---\n"
 		format_issue "$file"
@@ -224,15 +223,14 @@ view_all_issues() {
 
 list_issues() {
 	local issues_dir="$1"
-	local by_id_dir="$issues_dir/by-id"
 
-	[[ -d "$by_id_dir" ]] || error "issues directory not found: $by_id_dir"
+	[[ -d "$issues_dir" ]] || error "issues directory not found: $issues_dir"
 
-	for file in $(ls -v "$by_id_dir"/issue-*.json 2>/dev/null); do
+	for file in $(ls -v "$issues_dir"/*.json 2>/dev/null); do
 		[[ -f "$file" ]] || continue
 		local basename
 		basename="$(basename "$file" .json)"
-		local id="${basename#issue-}"
+		local id="$basename"
 		local title
 		title="$(jq -r '.title // "(no title)"' "$file")"
 		printf '%s\t%s\n' "$id" "$title"
@@ -250,7 +248,7 @@ main() {
 
 	case "$command" in
 		list)
-			local out_dir="./issues"
+			local out_dir="./backlog"
 			while [[ $# -gt 0 ]]; do
 				case "$1" in
 					--data)
@@ -301,7 +299,7 @@ main() {
 
 					[[ -n "$repo" ]] || error "--repo is required (format: owner/repo)"
 					if [[ -z "$out_dir" ]]; then
-						out_dir="./issues/"
+						out_dir="./backlog"
 					fi
 
 					pull_github_all_issues "$repo" "$out_dir"
@@ -317,7 +315,7 @@ main() {
 				issue_number="$1"
 				shift
 			fi
-			local out_dir="./issues"
+			local out_dir="./backlog"
 			while [[ $# -gt 0 ]]; do
 				case "$1" in
 					--data)
@@ -343,7 +341,7 @@ main() {
 			local user_prompt="${1:-}"
 			[[ -n "$user_prompt" ]] || error "missing prompt for 'edit' (e.g.: $SCRIPT_NAME edit \"merge similar issues\")"
 			shift
-			local out_dir="./issues"
+			local out_dir="./backlog"
 			while [[ $# -gt 0 ]]; do
 				case "$1" in
 					--data)
