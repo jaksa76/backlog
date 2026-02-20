@@ -12,6 +12,7 @@ usage() {
 	cat <<EOF
 Usage:
 	$SCRIPT_NAME pull github --repo <owner/repo> [--data <issues_dir>]
+	$SCRIPT_NAME pull jira --project <PROJECT_KEY> [--jql <jql>] [--data <issues_dir>]
 	$SCRIPT_NAME list [--data <issues_dir>]
 	$SCRIPT_NAME view [<issue_number>] [--data <issues_dir>]
 	$SCRIPT_NAME edit <prompt> [--data <issues_dir>]
@@ -21,14 +22,14 @@ Usage:
 	$SCRIPT_NAME push [--dry-run] [--force] [--data <issues_dir>]
 
 Implements:
-	pull       pull all issues from a github repository
+	pull       pull all issues from a github repository or jira project
 	list       list all issues stored locally
 	view       view a single issue or all issues in markdown format
 	edit       edit issues via an AI agent using a natural language prompt
 	changes    list issues changed locally (--local) or remotely since last pull (--remote)
 	conflicts  show fields changed both locally and remotely with different values
 	merge      apply non-conflicting remote changes to local issue files
-	push       push local changes to GitHub (skips conflicts unless --force)
+	push       push local changes to the source tracker (skips conflicts unless --force)
 
 Local conventions:
 	Delete an issue locally by removing its <number>.json file.
@@ -37,6 +38,9 @@ Local conventions:
 Examples:
 	$SCRIPT_NAME pull github --repo octocat/Hello-World
 	$SCRIPT_NAME pull github --repo octocat/Hello-World --data ./my-backlog
+	$SCRIPT_NAME pull jira --project MYPROJ
+	$SCRIPT_NAME pull jira --project MYPROJ --data ./my-backlog
+	$SCRIPT_NAME pull jira --jql "project = MYPROJ AND sprint in openSprints()" --data ./my-backlog
 	$SCRIPT_NAME list
 	$SCRIPT_NAME list --data ./my-backlog
 	$SCRIPT_NAME view
@@ -150,6 +154,159 @@ EOF
 	echo "Per-issue files written to $out_dir"
 }
 
+# ---------------------------------------------------------------------------
+# Jira fetch helpers
+# ---------------------------------------------------------------------------
+
+# jq -c -s filter: normalises a slurped JSON array of Jira view objects into
+# NDJSON of universal issue records.
+JIRA_NORMALIZE_JQ='
+	[
+		.[] |
+		if type == "array" then .[]
+		elif (type == "object" and has("issues")) then .issues[]
+		elif (type == "object" and has("key")) then .
+		else empty
+		end
+	][] |
+	. as $issue |
+	{
+		number: $issue.key,
+		title: ($issue.fields.summary // "(no title)"),
+		state: ($issue.fields.status.name // ""),
+		labels: ($issue.fields.labels // []),
+		assignees: [
+			$issue.fields.assignee // null |
+			select(. != null) |
+			.displayName
+		],
+		created_at: ($issue.fields.created // null),
+		updated_at: ($issue.fields.updated // null),
+		closed_at: ($issue.fields.resolutiondate // null),
+		html_url: (
+			($issue.self // "") |
+			if . == "" then ""
+			else gsub("/rest/api/[0-9]+/issue/[0-9]+$"; "") + "/browse/" + $issue.key
+			end
+		),
+		body: $issue.fields.description
+	}
+'
+
+# Fetch all Jira issues matching jql as a JSON array of raw view objects.
+# acli search --fields only allows a tiny fixed set, so we use a two-step
+# approach: search (paginated) to collect keys, then view per key for full data.
+# Outputs a JSON array to stdout; echoes progress to stderr.
+fetch_jira_full_json() {
+	local jql="$1"
+	local keys_file
+	keys_file="$(mktemp)"
+
+	acli jira workitem search \
+		--jql "$jql" \
+		--paginate \
+		--json \
+		> "$keys_file"
+
+	local keys total i=0
+	mapfile -t keys < <(jq -r '.[].key' "$keys_file" 2>/dev/null)
+	total="${#keys[@]}"
+	rm -f "$keys_file"
+
+	printf '[\n'
+	local first=true
+	for key in "${keys[@]}"; do
+		[[ -n "$key" ]] || continue
+		((i++)) || true
+		printf 'Fetching %d/%d: %s\n' "$i" "$total" "$key" >&2
+		[[ "$first" == true ]] || printf ',\n'
+		acli jira workitem view "$key" \
+			--fields 'summary,status,labels,assignee,created,updated,resolutiondate,description' \
+			--json
+		first=false
+	done
+	printf '\n]\n'
+}
+
+pull_jira_all_issues() {
+	local project="$1"
+	local jql_override="$2"
+	local out_dir="$3"
+	local snapshot_dir="$out_dir/.snapshot"
+	local raw_file="$snapshot_dir/jira-raw.json"
+	local issues_file="$snapshot_dir/issues.ndjson"
+	local manifest_file="$snapshot_dir/manifest.json"
+	local sources_file="$snapshot_dir/sources.json"
+	local pulled_at
+	local issue_count
+
+	require_command acli
+	require_command jq
+
+	mkdir -p "$out_dir"
+	mkdir -p "$snapshot_dir"
+
+	pulled_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+	local jql
+	if [[ -n "$jql_override" ]]; then
+		jql="$jql_override"
+	else
+		jql="project = \"$project\" ORDER BY created DESC"
+	fi
+
+	# Fetch raw Jira issues – saved for auditing and future push support.
+	# Uses a 2-step approach: search for keys, then view each key for full fields
+	# (acli search --fields only allows a small fixed set).
+	echo "Fetching issue list..." >&2
+	fetch_jira_full_json "$jql" > "$raw_file"
+
+	# Normalise raw JSON array to universal NDJSON
+	jq -c -s "$JIRA_NORMALIZE_JQ" "$raw_file" > "$issues_file"
+
+	issue_count="$(wc -l < "$issues_file" | tr -d ' ')"
+
+	# Write per-issue files in universal format
+	while IFS= read -r line; do
+		local key
+		key="$(jq -r '.number // empty' <<< "$line")"
+		[[ -n "$key" ]] || continue
+		jq '.' <<< "$line" > "$out_dir/$key.json"
+	done < "$issues_file"
+
+	# Manifest (Jira-specific metadata in .snapshot/)
+	cat > "$manifest_file" <<EOF
+{
+	"version": "1",
+	"kind": "jira",
+	"project": "$project",
+	"jql": $(jq -n --arg v "$jql" '$v'),
+	"pulledAt": "$pulled_at",
+	"issueCount": $issue_count,
+	"files": {
+		"raw": ".snapshot/jira-raw.json",
+		"issues": ".snapshot/issues.ndjson",
+		"byKey": ".."
+	}
+}
+EOF
+
+	# Sources (Jira-specific tool/query details in .snapshot/)
+	cat > "$sources_file" <<EOF
+{
+	"kind": "jira",
+	"project": "$project",
+	"jql": $(jq -n --arg v "$jql" '$v'),
+	"tool": "acli",
+	"command": "acli jira workitem search"
+}
+EOF
+
+	echo "Pulled $issue_count issues from Jira project $project"
+	echo "Snapshot written to $snapshot_dir"
+	echo "Per-issue files written to $out_dir"
+}
+
 # invoke_agent sends a system prompt and user prompt to a CLI AI agent.
 # Replace the body of this function to use a different agent.
 invoke_agent() {
@@ -200,7 +357,15 @@ format_issue() {
 	updated_at="$(jq -r '.updated_at // ""' "$issue_file")"
 	closed_at="$(jq -r '.closed_at // "null"' "$issue_file")"
 	html_url="$(jq -r '.html_url // ""' "$issue_file")"
-	body="$(jq -r '.body // ""' "$issue_file")"
+	# Render body for display: extract text from ADF if needed
+	body="$(jq -r '
+		.body //  "" |
+		if type == "string" then .
+		elif (type == "object" and .type == "doc") then
+			[.. | objects | select(has("text")) | .text] | join("")
+		else tostring
+		end
+	' "$issue_file")"
 
 	cat <<EOF
 # Issue #$number: $title
@@ -272,11 +437,32 @@ list_issues() {
 # Snapshot / remote helpers
 # ---------------------------------------------------------------------------
 
+get_source_kind() {
+	local issues_dir="$1"
+	local manifest="$issues_dir/.snapshot/manifest.json"
+	[[ -f "$manifest" ]] || error "no snapshot manifest found in $issues_dir/.snapshot/ - run 'pull' first"
+	jq -r '.kind' "$manifest"
+}
+
 get_repo_from_manifest() {
 	local issues_dir="$1"
 	local manifest="$issues_dir/.snapshot/manifest.json"
 	[[ -f "$manifest" ]] || error "no snapshot manifest found in $issues_dir/.snapshot/ - run 'pull' first"
 	jq -r '.repo' "$manifest"
+}
+
+get_jira_project_from_manifest() {
+	local issues_dir="$1"
+	local manifest="$issues_dir/.snapshot/manifest.json"
+	[[ -f "$manifest" ]] || error "no snapshot manifest found in $issues_dir/.snapshot/ - run 'pull' first"
+	jq -r '.project' "$manifest"
+}
+
+get_jira_jql_from_manifest() {
+	local issues_dir="$1"
+	local manifest="$issues_dir/.snapshot/manifest.json"
+	[[ -f "$manifest" ]] || error "no snapshot manifest found in $issues_dir/.snapshot/ - run 'pull' first"
+	jq -r '.jql' "$manifest"
 }
 
 require_snapshot() {
@@ -285,7 +471,7 @@ require_snapshot() {
 }
 
 # Fetch current issues from GitHub as normalised ndjson (stdout), without modifying snapshot
-fetch_remote_ndjson() {
+fetch_remote_ndjson_github() {
 	local repo="$1"
 	require_command gh
 	gh api \
@@ -304,6 +490,38 @@ fetch_remote_ndjson() {
 			html_url,
 			body
 		}'
+}
+
+# Fetch current issues from Jira as normalised ndjson (stdout), without modifying snapshot
+fetch_remote_ndjson_jira() {
+	local project="$1"
+	local jql="$2"
+	local tmp_raw
+	tmp_raw="$(mktemp)"
+	require_command acli
+	fetch_jira_full_json "$jql" > "$tmp_raw"
+	jq -c -s "$JIRA_NORMALIZE_JQ" "$tmp_raw"
+	rm -f "$tmp_raw"
+}
+
+# Dispatch to the right fetch function based on snapshot manifest kind
+fetch_remote_for_dir() {
+	local issues_dir="$1"
+	local kind
+	kind="$(get_source_kind "$issues_dir")"
+	case "$kind" in
+		github)
+			fetch_remote_ndjson_github "$(get_repo_from_manifest "$issues_dir")"
+			;;
+		jira)
+			fetch_remote_ndjson_jira \
+				"$(get_jira_project_from_manifest "$issues_dir")" \
+				"$(get_jira_jql_from_manifest "$issues_dir")"
+			;;
+		*)
+			error "unsupported source kind in manifest: $kind"
+			;;
+	esac
 }
 
 # Output names of COMPARABLE_FIELDS that differ between two JSON strings
@@ -373,9 +591,6 @@ compute_remote_changes() {
 	local snapshot_file="$issues_dir/.snapshot/issues.ndjson"
 	require_snapshot "$issues_dir"
 
-	local repo
-	repo="$(get_repo_from_manifest "$issues_dir")"
-
 	declare -A snap_data
 	while IFS= read -r line; do
 		local num
@@ -390,7 +605,7 @@ compute_remote_changes() {
 		num="$(jq -r '.number' <<< "$line")"
 		[[ -n "$num" ]] || continue
 		remote_data["$num"]="$line"
-	done < <(fetch_remote_ndjson "$repo")
+	done < <(fetch_remote_for_dir "$issues_dir")
 
 	# New remotely (not in snapshot)
 	for num in "${!remote_data[@]}"; do
@@ -453,9 +668,6 @@ show_conflicts() {
 	local snapshot_file="$issues_dir/.snapshot/issues.ndjson"
 	require_snapshot "$issues_dir"
 
-	local repo
-	repo="$(get_repo_from_manifest "$issues_dir")"
-
 	declare -A snap_data
 	while IFS= read -r line; do
 		local num
@@ -471,7 +683,7 @@ show_conflicts() {
 		num="$(jq -r '.number' <<< "$line")"
 		[[ -n "$num" ]] || continue
 		remote_data["$num"]="$line"
-	done < <(fetch_remote_ndjson "$repo")
+	done < <(fetch_remote_for_dir "$issues_dir")
 
 	local any_conflict=false
 	for num in "${!snap_data[@]}"; do
@@ -523,9 +735,6 @@ merge_issues() {
 	local snapshot_file="$issues_dir/.snapshot/issues.ndjson"
 	require_snapshot "$issues_dir"
 
-	local repo
-	repo="$(get_repo_from_manifest "$issues_dir")"
-
 	declare -A snap_data
 	while IFS= read -r line; do
 		local num
@@ -541,7 +750,7 @@ merge_issues() {
 		num="$(jq -r '.number' <<< "$line")"
 		[[ -n "$num" ]] || continue
 		remote_data["$num"]="$line"
-	done < <(fetch_remote_ndjson "$repo")
+	done < <(fetch_remote_for_dir "$issues_dir")
 
 	local added=0 merged=0 skipped_fields=0
 	for num in "${!remote_data[@]}"; do
@@ -603,7 +812,7 @@ merge_issues() {
 # push
 # ---------------------------------------------------------------------------
 
-push_changes() {
+push_changes_github() {
 	local issues_dir="$1"
 	local dry_run="$2"
 	local force="$3"
@@ -630,7 +839,7 @@ push_changes() {
 			num="$(jq -r '.number' <<< "$line")"
 			[[ -n "$num" ]] || continue
 			remote_data["$num"]="$line"
-		done < <(fetch_remote_ndjson "$repo")
+		done < <(fetch_remote_ndjson_github "$repo")
 	fi
 
 	local created=0 updated=0 closed=0 skipped=0
@@ -773,6 +982,253 @@ push_changes() {
 	fi
 }
 
+push_changes_jira() {
+	local issues_dir="$1"
+	local dry_run="$2"
+	local force="$3"
+	local snapshot_file="$issues_dir/.snapshot/issues.ndjson"
+	require_snapshot "$issues_dir"
+
+	local project jql
+	project="$(get_jira_project_from_manifest "$issues_dir")"
+	jql="$(get_jira_jql_from_manifest "$issues_dir")"
+
+	require_command acli
+
+	declare -A snap_data
+	while IFS= read -r line; do
+		local num
+		num="$(jq -r '.number' <<< "$line")"
+		[[ -n "$num" ]] || continue
+		snap_data["$num"]="$line"
+	done < "$snapshot_file"
+
+	declare -A remote_data
+	if [[ "$force" == false ]]; then
+		echo "Fetching remote state for conflict detection..." >&2
+		while IFS= read -r line; do
+			local num
+			num="$(jq -r '.number' <<< "$line")"
+			[[ -n "$num" ]] || continue
+			remote_data["$num"]="$line"
+		done < <(fetch_remote_ndjson_jira "$project" "$jql")
+	fi
+
+	local created=0 updated=0 closed=0 skipped=0
+
+	# --- New issues (new-issue-* files) ---
+	for f in "$issues_dir"/new-issue-*.json; do
+		[[ -f "$f" ]] || continue
+		local name title
+		name="$(basename "$f" .json)"
+		title="$(jq -r '.title // ""' "$f")"
+
+		if [[ "$dry_run" == true ]]; then
+			printf 'would create  [%s]: %s\n' "$name" "$title"
+			((created++)) || true
+			continue
+		fi
+
+		local create_args=("--project" "$project" "--type" "Task" "--summary" "$title" "--json" "--yes")
+		local labels_csv
+		labels_csv="$(jq -r '.labels // [] | join(",")' "$f")"
+		[[ -z "$labels_csv" ]] || create_args+=("--label" "$labels_csv")
+		local assignee
+		assignee="$(jq -r '.assignees[0] // ""' "$f")"
+		[[ -z "$assignee" ]] || create_args+=("--assignee" "$assignee")
+
+		local desc_file=""
+		local body_type
+		body_type="$(jq -r '.body | type' "$f")"
+		if [[ "$body_type" != "null" ]]; then
+			desc_file="$(mktemp)"
+			if [[ "$body_type" == "string" ]]; then
+				jq -r '.body' "$f" > "$desc_file"
+			else
+				jq -c '.body' "$f" > "$desc_file"
+			fi
+			create_args+=("--description-file" "$desc_file")
+		fi
+
+		local new_key
+		new_key="$(acli jira workitem create "${create_args[@]}" | jq -r '.key // ""')"
+		[[ -z "$desc_file" ]] || rm -f "$desc_file"
+
+		if [[ -n "$new_key" ]]; then
+			printf 'created  %s  %s  (was %s)\n' "$new_key" "$title" "$name"
+			jq --arg k "$new_key" '.number = $k' "$f" > "$issues_dir/$new_key.json"
+			rm "$f"
+		else
+			printf 'created  (key unknown)  %s  (was %s)\n' "$title" "$name"
+		fi
+		((created++)) || true
+	done
+
+	# --- Deleted issues (in snapshot but file gone) ---
+	for num in "${!snap_data[@]}"; do
+		[[ -f "$issues_dir/$num.json" ]] && continue
+		local snap_title
+		snap_title="$(jq -r '.title // "(no title)"' <<< "${snap_data[$num]}")"
+
+		# Skip if remote also changed since pull (unless --force)
+		if [[ "$force" == false && -v remote_data["$num"] ]]; then
+			local changed_fields
+			changed_fields="$(fields_that_differ "${snap_data[$num]}" "${remote_data[$num]}")"
+			if [[ -n "$changed_fields" ]]; then
+				printf 'skipped  %s  %s  (remote changed since pull; use --force to override)\n' "$num" "$snap_title"
+				((skipped++)) || true
+				continue
+			fi
+		fi
+
+		if [[ "$dry_run" == true ]]; then
+			printf 'would transition  %s: %s  → Done\n' "$num" "$snap_title"
+			((closed++)) || true
+			continue
+		fi
+
+		# Jira has no delete via API; transition to Done as best effort
+		if acli jira workitem transition --key "$num" --status "Done" --yes > /dev/null 2>&1; then
+			printf 'closed   %s  %s\n' "$num" "$snap_title"
+		else
+			printf 'warning  %s  %s  (transition to "Done" failed; close manually in Jira)\n' "$num" "$snap_title"
+		fi
+		((closed++)) || true
+	done
+
+	# --- Modified issues ---
+	for num in "${!snap_data[@]}"; do
+		local local_file="$issues_dir/$num.json"
+		[[ -f "$local_file" ]] || continue
+
+		local snap="${snap_data[$num]}"
+		local changed_fields
+		changed_fields="$(fields_that_differ "$snap" "$(cat "$local_file")")"
+		[[ -n "$changed_fields" ]] || continue
+
+		local title
+		title="$(jq -r '.title // "(no title)"' "$local_file")"
+
+		# Conflict detection
+		if [[ "$force" == false && -v remote_data["$num"] ]]; then
+			local remote="${remote_data[$num]}"
+			local has_conflict=false
+			for field in "${COMPARABLE_FIELDS[@]}"; do
+				local snap_val local_val remote_val
+				snap_val="$(jq -c --arg f "$field" '.[$f]' <<< "$snap")"
+				local_val="$(jq -c --arg f "$field" '.[$f]' <<< "$(cat "$local_file")")"
+				remote_val="$(jq -c --arg f "$field" '.[$f]' <<< "$remote")"
+				if [[ "$local_val" != "$snap_val" && "$remote_val" != "$snap_val" && "$local_val" != "$remote_val" ]]; then
+					has_conflict=true
+					break
+				fi
+			done
+			if [[ "$has_conflict" == true ]]; then
+				printf 'skipped  %s  %s  (has conflicts; run conflicts to review or use --force)\n' "$num" "$title"
+				((skipped++)) || true
+				continue
+			fi
+		fi
+
+		local local_json
+		local_json="$(cat "$local_file")"
+
+		# Build edit args; state changes require a separate transition call
+		local state_changed=false
+		local edit_args=("--key" "$num" "--yes")
+		local has_edit_args=false
+		local desc_file=""
+
+		for field in "${COMPARABLE_FIELDS[@]}"; do
+			local snap_val local_val
+			snap_val="$(jq -c --arg f "$field" '.[$f]' <<< "$snap")"
+			local_val="$(jq -c --arg f "$field" '.[$f]' <<< "$local_json")"
+			[[ "$local_val" != "$snap_val" ]] || continue
+
+			case "$field" in
+				state)
+					state_changed=true
+					;;
+				title)
+					edit_args+=("--summary" "$(jq -r '.title' "$local_file")")
+					has_edit_args=true
+					;;
+				labels)
+					local labels_csv
+					labels_csv="$(jq -r '.labels // [] | join(",")' "$local_file")"
+					edit_args+=("--labels" "$labels_csv")
+					has_edit_args=true
+					;;
+				assignees)
+					local assignee
+					assignee="$(jq -r '.assignees[0] // ""' "$local_file")"
+					if [[ -n "$assignee" ]]; then
+						edit_args+=("--assignee" "$assignee")
+					else
+						edit_args+=("--remove-assignee")
+					fi
+					has_edit_args=true
+					;;
+				body)
+					desc_file="$(mktemp)"
+					local body_type
+					body_type="$(jq -r '.body | type' "$local_file")"
+					if [[ "$body_type" == "string" ]]; then
+						jq -r '.body // ""' "$local_file" > "$desc_file"
+					else
+						jq -c '.body' "$local_file" > "$desc_file"
+					fi
+					edit_args+=("--description-file" "$desc_file")
+					has_edit_args=true
+					;;
+			esac
+		done
+
+		if [[ "$dry_run" == true ]]; then
+			printf 'would update  %s: %s\n' "$num" "$title"
+			[[ "$has_edit_args" == false ]] || printf '  edit: %s\n' "${edit_args[*]}"
+			[[ "$state_changed" == false ]] || printf '  transition → %s\n' "$(jq -r '.state' "$local_file")"
+			[[ -z "$desc_file" ]] || rm -f "$desc_file"
+			((updated++)) || true
+			continue
+		fi
+
+		[[ "$has_edit_args" == false ]] || acli jira workitem edit "${edit_args[@]}" > /dev/null
+		[[ -z "$desc_file" ]] || rm -f "$desc_file"
+
+		if [[ "$state_changed" == true ]]; then
+			local new_state
+			new_state="$(jq -r '.state' "$local_file")"
+			acli jira workitem transition --key "$num" --status "$new_state" --yes > /dev/null
+		fi
+
+		printf 'updated  %s  %s\n' "$num" "$title"
+		((updated++)) || true
+	done
+
+	echo ""
+	if [[ "$dry_run" == true ]]; then
+		printf 'Dry run: %d to create, %d to update, %d to close, %d skipped.\n' "$created" "$updated" "$closed" "$skipped"
+	else
+		printf 'Done: %d created, %d updated, %d closed, %d skipped.\n' "$created" "$updated" "$closed" "$skipped"
+	fi
+}
+
+push_changes() {
+	local issues_dir="$1"
+	local dry_run="$2"
+	local force="$3"
+	require_snapshot "$issues_dir"
+
+	local kind
+	kind="$(get_source_kind "$issues_dir")"
+	case "$kind" in
+		github) push_changes_github "$@" ;;
+		jira)   push_changes_jira   "$@" ;;
+		*)      error "unsupported source kind in manifest: $kind" ;;
+	esac
+}
+
 
 main() {
 	if [[ $# -lt 1 ]]; then
@@ -840,6 +1296,43 @@ main() {
 					fi
 
 					pull_github_all_issues "$repo" "$out_dir"
+					;;
+				jira)
+					local project=""
+					local jql_override=""
+					local out_dir=""
+
+					while [[ $# -gt 0 ]]; do
+						case "$1" in
+							--project)
+								project="${2:-}"
+								shift 2
+								;;
+							--jql)
+								jql_override="${2:-}"
+								shift 2
+								;;
+							--data)
+								out_dir="${2:-}"
+								shift 2
+								;;
+							-h|--help)
+								usage
+								exit 0
+								;;
+							*)
+								error "unknown argument: $1"
+								;;
+						esac
+					done
+
+					[[ -n "$project" || -n "$jql_override" ]] || \
+						error "--project is required (or provide --jql with an explicit project filter)"
+					if [[ -z "$out_dir" ]]; then
+						out_dir="./backlog"
+					fi
+
+					pull_jira_all_issues "$project" "$jql_override" "$out_dir"
 					;;
 				*)
 					error "unsupported source for pull: $source"
